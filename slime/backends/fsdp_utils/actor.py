@@ -19,7 +19,14 @@ from slime.utils.data import get_minimum_num_micro_batch_size, process_rollout_d
 from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.metric_utils import compute_rollout_step
-from slime.utils.ppo_utils import compute_approx_kl, compute_gspo_kl, compute_opsm_mask, compute_policy_loss
+from slime.utils.ppo_utils import (
+    compute_approx_kl,
+    compute_gspo_kl,
+    compute_gspo_kl_with_cp,
+    compute_opsm_mask,
+    compute_opsm_mask_with_cp,
+    compute_policy_loss,
+)
 from slime.utils.processing_utils import load_processor, load_tokenizer
 from slime.utils.ray_utils import Box
 from slime.utils.timer import Timer, inverse_timer, timer
@@ -504,16 +511,75 @@ class FSDPTrainRayActor(TrainRayActor):
         for metric_key in ["log_probs", "rollout_log_probs", "ref_log_probs", "advantages", "returns"]:
             if metric_key not in packed_batches[0]:
                 continue
-            val = torch.tensor([0.0], device=torch.cuda.current_device())
-            for _mbs_id, batches in enumerate(packed_batches):
-                unpacked_batches = unpack_sequences(batches)
-                for unpacked_batch in unpacked_batches:
-                    if isinstance(unpacked_batch[metric_key], torch.Tensor):
-                        loss_masks_tensor = unpacked_batch["loss_masks"].to(device=torch.cuda.current_device())
-                        metric_tensor = unpacked_batch[metric_key].to(device=torch.cuda.current_device())
-                        val += (metric_tensor * loss_masks_tensor).sum() / loss_masks_tensor.sum().clamp_min(1)
-                    else:
-                        val += unpacked_batch[metric_key]
+            val = torch.zeros((), device=torch.cuda.current_device())
+
+            if self.cp_size == 1:
+                for _mbs_id, batches in enumerate(packed_batches):
+                    unpacked_batches = unpack_sequences(batches)
+                    for unpacked_batch in unpacked_batches:
+                        if isinstance(unpacked_batch[metric_key], torch.Tensor):
+                            loss_masks_tensor = unpacked_batch["loss_masks"].to(device=torch.cuda.current_device())
+                            metric_tensor = unpacked_batch[metric_key].to(device=torch.cuda.current_device())
+                            val += (metric_tensor * loss_masks_tensor).sum() / loss_masks_tensor.sum().clamp_min(1)
+                        else:
+                            val += unpacked_batch[metric_key]
+            else:
+
+                def _split_by_lengths(t: torch.Tensor, lengths: list[int]) -> list[torch.Tensor]:
+                    out: list[torch.Tensor] = []
+                    off = 0
+                    for L in lengths:
+                        L = int(L)
+                        out.append(t[off : off + L])
+                        off += L
+                    return out
+
+                for _mbs_id, batches in enumerate(packed_batches):
+                    response_lengths = list(batches["response_lengths"])
+                    full_loss_masks = _split_by_lengths(
+                        batches["loss_masks"].to(device=torch.cuda.current_device()), response_lengths
+                    )
+
+                    if metric_key in ["advantages", "returns", "rollout_log_probs"]:
+                        metric_tensor = batches[metric_key].to(device=torch.cuda.current_device())
+                        metric_per_seq = _split_by_lengths(metric_tensor, response_lengths)
+                        for m_i, mask_i in zip(metric_per_seq, full_loss_masks, strict=False):
+                            denom = mask_i.sum().clamp_min(1)
+                            val += (m_i * mask_i).sum() / denom
+                        continue
+
+                    # token-domain metrics (log_probs/ref_log_probs): slice local response
+                    metric_token = batches[metric_key].to(device=torch.cuda.current_device())
+                    chunk_size = int(batches["tokens"].shape[0] // self.cp_size)
+                    pad_length = _get_trailing_pad_len_for_cp(batches["tokens"], self.cp_size)
+                    slices = _get_local_response_logprob_slices_for_packed_batch(
+                        cu_seqlens=batches["cu_seqlens"],
+                        response_lengths=response_lengths,
+                        cp_rank=self.cp_rank,
+                        cp_size=self.cp_size,
+                        chunk_size=chunk_size,
+                        pad_length=pad_length,
+                    )
+
+                    local_metric_list: list[torch.Tensor] = []
+                    local_masks_list: list[torch.Tensor] = []
+                    local_lens: list[int] = []
+                    for i, (resp_start, resp_end, local_lp_start, local_lp_end) in enumerate(slices):
+                        resp_start, resp_end = int(resp_start), int(resp_end)
+                        local_lp_start, local_lp_end = int(local_lp_start), int(local_lp_end)
+                        local_metric = metric_token[local_lp_start:local_lp_end]
+                        local_mask = full_loss_masks[i][resp_start:resp_end]
+                        local_metric_list.append(local_metric)
+                        local_masks_list.append(local_mask)
+                        local_lens.append(int(local_metric.numel()))
+
+                    local_metric_flat = torch.cat(local_metric_list, dim=0)
+                    partial = sum_of_sample_mean_with_cp(
+                        local_metric_flat, local_lens, local_masks_list, full_loss_masks, self.cp_rank, self.cp_size
+                    ).detach()
+                    dist.all_reduce(partial, op=dist.ReduceOp.SUM, group=self.cp_group)
+                    val += partial
+
             dist.all_reduce(val, op=dist.ReduceOp.SUM, group=self.dp_group)
             log_dict[f"rollout/{metric_key}"] = (
                 val / (self.args.n_samples_per_prompt * self.args.rollout_batch_size)
@@ -600,132 +666,378 @@ class FSDPTrainRayActor(TrainRayActor):
         packed_batch["cur_log_probs"] = log_probs
         packed_batch["entropy"] = entropy_result
 
-        unpacked_batches = unpack_sequences(packed_batch)
-
         old_log_prob_key = "rollout_log_probs" if self.args.use_rollout_logprobs else "log_probs"
-        missing_old_log_probs = [
-            idx
-            for idx, batch in enumerate(unpacked_batches)
-            if old_log_prob_key not in batch or not isinstance(batch[old_log_prob_key], torch.Tensor)
-        ]
-        if missing_old_log_probs:
-            raise KeyError(
-                f"{old_log_prob_key} must be provided as torch.Tensor for all microbatches when "
-                f"use_rollout_logprobs is set to {self.args.use_rollout_logprobs}. Missing in batches: {missing_old_log_probs}"
-            )
-        old_log_probs = torch.cat([batch[old_log_prob_key] for batch in unpacked_batches], dim=0)
-        log_probs = torch.cat([batch["cur_log_probs"] for batch in unpacked_batches], dim=0)
-        advantages = torch.cat([batch["advantages"] for batch in unpacked_batches], dim=0)
-        loss_masks = [batch["loss_masks"].to(device=log_probs.device) for batch in unpacked_batches]
-        response_lengths = [batch["response_lengths"] for batch in unpacked_batches]
+        # CP-optimized path: avoid all_gather of per-token tensors by computing
+        # local response slices and using all_reduce on scalars / per-sequence sums.
+        if self.cp_size > 1:
 
-        advantages = advantages.to(device=log_probs.device)
-        old_log_probs = old_log_probs.to(device=log_probs.device)
-        ppo_kl = old_log_probs - log_probs
+            def _split_by_lengths(t: torch.Tensor, lengths: list[int]) -> list[torch.Tensor]:
+                out: list[torch.Tensor] = []
+                off = 0
+                for L in lengths:
+                    L = int(L)
+                    out.append(t[off : off + L])
+                    off += L
+                return out
 
-        if self.args.use_opsm:
-            opsm_mask, opsm_clipfrac = compute_opsm_mask(
-                args=self.args,
-                full_log_probs=[batch["cur_log_probs"] for batch in unpacked_batches],
-                full_old_log_probs=[batch[old_log_prob_key] for batch in unpacked_batches],
-                advantages=[batch["advantages"] for batch in unpacked_batches],
-                loss_masks=loss_masks,
-            )
+            response_lengths = list(packed_batch["response_lengths"])
+            device = packed_batch["cur_log_probs"].device
 
-        if self.args.advantage_estimator == "gspo":
-            ppo_kl = compute_gspo_kl(
-                full_log_probs=[batch["cur_log_probs"] for batch in unpacked_batches],
-                full_old_log_probs=[batch[old_log_prob_key] for batch in unpacked_batches],
-                local_log_probs=[batch["cur_log_probs"] for batch in unpacked_batches],
-                loss_masks=loss_masks,
+            full_loss_masks = _split_by_lengths(packed_batch["loss_masks"].to(device=device), response_lengths)
+            full_advantages = _split_by_lengths(packed_batch["advantages"].to(device=device), response_lengths)
+
+            # Optional rollout log-probs (response-only).
+            has_rollout_log_probs = isinstance(packed_batch.get("rollout_log_probs"), torch.Tensor) and packed_batch[
+                "rollout_log_probs"
+            ].numel() > 0
+            full_rollout_log_probs = (
+                _split_by_lengths(packed_batch["rollout_log_probs"].to(device=device), response_lengths)
+                if has_rollout_log_probs
+                else None
             )
 
-        pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, self.args.eps_clip, self.args.eps_clip_high)
+            # Old log-probs are either response-only rollout_log_probs or CP-local token log-probs.
+            if old_log_prob_key == "rollout_log_probs":
+                if not has_rollout_log_probs or full_rollout_log_probs is None:
+                    raise KeyError("rollout_log_probs must be provided as non-empty torch.Tensor when use_rollout_logprobs is enabled.")
+            else:
+                if old_log_prob_key not in packed_batch or not isinstance(packed_batch[old_log_prob_key], torch.Tensor):
+                    raise KeyError(f"{old_log_prob_key} must be provided as torch.Tensor for CP training when use_rollout_logprobs is disabled.")
 
-        if self.args.use_opsm:
-            pg_loss = pg_loss * opsm_mask
-
-        def _has_rollout_log_probs(batch) -> bool:
-            rollout_tensor = batch.get("rollout_log_probs")
-            return isinstance(rollout_tensor, torch.Tensor) and rollout_tensor.numel() > 0
-
-        has_rollout_log_probs = all(_has_rollout_log_probs(batch) for batch in unpacked_batches)
-        rollout_log_probs = (
-            torch.cat([batch["rollout_log_probs"] for batch in unpacked_batches], dim=0)
-            if has_rollout_log_probs
-            else None
-        )
-
-        # Apply TIS before sample mean calculation
-        if self.args.use_tis:
-            # Apply TIS off-policy correction using importance sampling
-            assert (
-                has_rollout_log_probs and rollout_log_probs is not None
-            ), "rollout_log_probs must be provided as non-empty torch.Tensor for TIS"
-
-            tis = torch.exp(old_log_probs - rollout_log_probs)
-            ois = (-ppo_kl).exp()
-            tis_clip = torch.clamp(
-                tis, min=getattr(self.args, "tis_clip_low", 0.1), max=getattr(self.args, "tis_clip", 2.0)
+            chunk_size = int(model_args["input_ids"].shape[1])
+            pad_length = _get_trailing_pad_len_for_cp(packed_batch["tokens"], self.cp_size)
+            slices = _get_local_response_logprob_slices_for_packed_batch(
+                cu_seqlens=packed_batch["cu_seqlens"],
+                response_lengths=response_lengths,
+                cp_rank=self.cp_rank,
+                cp_size=self.cp_size,
+                chunk_size=chunk_size,
+                pad_length=pad_length,
             )
-            tis_clipfrac = tis_clip != tis
 
-            pg_loss = pg_loss * tis_clip
+            cur_log_probs_local_token = packed_batch["cur_log_probs"]
+            entropy_local_token = packed_batch["entropy"]
+            old_log_probs_local_token = packed_batch.get(old_log_prob_key) if old_log_prob_key != "rollout_log_probs" else None
 
-        assert not self.args.calculate_per_token_loss, "calculate_per_token_loss not yet implemented"
-        pg_loss = sum_of_sample_mean(pg_loss, response_lengths, loss_masks)
-        pg_clipfrac = sum_of_sample_mean(pg_clipfrac, response_lengths, loss_masks)
-        ppo_kl = sum_of_sample_mean(ppo_kl.abs(), response_lengths, loss_masks)
+            ref_log_probs_local_token = packed_batch.get("ref_log_probs") if self.args.use_kl_loss else None
 
-        # Only compare rollout vs. train log probs when they originate from different stages.
-        train_rollout_logprob_abs_diff = None
-        if not self.args.use_rollout_logprobs and rollout_log_probs is not None:
-            train_rollout_logprob_abs_diff = (old_log_probs - rollout_log_probs).abs()
-            train_rollout_logprob_abs_diff = sum_of_sample_mean(
-                train_rollout_logprob_abs_diff, response_lengths, loss_masks
+            local_log_probs_list: list[torch.Tensor] = []
+            local_old_log_probs_list: list[torch.Tensor] = []
+            local_entropy_list: list[torch.Tensor] = []
+            local_advantages_list: list[torch.Tensor] = []
+            local_loss_masks_list: list[torch.Tensor] = []
+            local_rollout_log_probs_list: list[torch.Tensor] | None = [] if has_rollout_log_probs else None
+            local_response_lengths: list[int] = []
+
+            for i, (resp_start, resp_end, local_lp_start, local_lp_end) in enumerate(slices):
+                resp_start, resp_end = int(resp_start), int(resp_end)
+                local_lp_start, local_lp_end = int(local_lp_start), int(local_lp_end)
+
+                local_lp = cur_log_probs_local_token[local_lp_start:local_lp_end]
+                local_ent = entropy_local_token[local_lp_start:local_lp_end]
+                local_adv = full_advantages[i][resp_start:resp_end]
+                local_mask = full_loss_masks[i][resp_start:resp_end]
+
+                if old_log_prob_key == "rollout_log_probs":
+                    assert full_rollout_log_probs is not None
+                    local_old_lp = full_rollout_log_probs[i][resp_start:resp_end]
+                else:
+                    assert old_log_probs_local_token is not None
+                    local_old_lp = old_log_probs_local_token[local_lp_start:local_lp_end]
+
+                local_log_probs_list.append(local_lp)
+                local_old_log_probs_list.append(local_old_lp)
+                local_entropy_list.append(local_ent)
+                local_advantages_list.append(local_adv)
+                local_loss_masks_list.append(local_mask)
+                local_response_lengths.append(int(local_lp.numel()))
+
+                if local_rollout_log_probs_list is not None:
+                    assert full_rollout_log_probs is not None
+                    local_rollout_log_probs_list.append(full_rollout_log_probs[i][resp_start:resp_end])
+
+            log_probs = torch.cat(local_log_probs_list, dim=0)
+            old_log_probs = torch.cat(local_old_log_probs_list, dim=0)
+            advantages = torch.cat(local_advantages_list, dim=0)
+            entropy = torch.cat(local_entropy_list, dim=0)
+
+            ppo_kl = old_log_probs - log_probs
+
+            # OPSM mask (CP optimized)
+            if self.args.use_opsm:
+                opsm_mask, opsm_clipfrac = compute_opsm_mask_with_cp(
+                    args=self.args,
+                    local_log_probs=local_log_probs_list,
+                    local_old_log_probs=local_old_log_probs_list,
+                    local_advantages=local_advantages_list,
+                    local_loss_masks=local_loss_masks_list,
+                    full_loss_masks=full_loss_masks,
+                    cp_group=self.cp_group,
+                    cp_size=self.cp_size,
+                )
+
+            # GSPO KL (CP optimized)
+            if self.args.advantage_estimator == "gspo":
+                ppo_kl = compute_gspo_kl_with_cp(
+                    local_log_probs=local_log_probs_list,
+                    local_old_log_probs=local_old_log_probs_list,
+                    local_loss_masks=local_loss_masks_list,
+                    full_loss_masks=full_loss_masks,
+                    cp_group=self.cp_group,
+                    cp_size=self.cp_size,
+                )
+
+            pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, self.args.eps_clip, self.args.eps_clip_high)
+
+            if self.args.use_opsm:
+                pg_loss = pg_loss * opsm_mask
+
+            rollout_log_probs = torch.cat(local_rollout_log_probs_list, dim=0) if local_rollout_log_probs_list is not None else None
+
+            tis = ois = tis_clipfrac = None
+            if self.args.use_tis:
+                assert rollout_log_probs is not None, "rollout_log_probs must be provided as non-empty torch.Tensor for TIS"
+                tis = torch.exp(old_log_probs - rollout_log_probs)
+                ois = (-ppo_kl).exp()
+                tis_clip = torch.clamp(
+                    tis, min=getattr(self.args, "tis_clip_low", 0.1), max=getattr(self.args, "tis_clip", 2.0)
+                )
+                tis_clipfrac = tis_clip != tis
+                pg_loss = pg_loss * tis_clip
+
+            assert not self.args.calculate_per_token_loss, "calculate_per_token_loss not yet implemented"
+
+            # Scalar reductions: partial per-CP-rank -> full via all_reduce (O(num_sequences) or O(1)).
+            pg_loss = sum_of_sample_mean_with_cp(
+                pg_loss, local_response_lengths, local_loss_masks_list, full_loss_masks, self.cp_rank, self.cp_size
+            )
+            pg_loss = torch.distributed.nn.functional.all_reduce(pg_loss, op=dist.ReduceOp.SUM, group=self.cp_group)
+
+            pg_clipfrac = sum_of_sample_mean_with_cp(
+                pg_clipfrac.float(),
+                local_response_lengths,
+                local_loss_masks_list,
+                full_loss_masks,
+                self.cp_rank,
+                self.cp_size,
             ).detach()
+            dist.all_reduce(pg_clipfrac, op=dist.ReduceOp.SUM, group=self.cp_group)
 
-        entropy = torch.cat([batch["entropy"] for batch in unpacked_batches], dim=0)
-        entropy_loss = sum_of_sample_mean(entropy, response_lengths, loss_masks)
+            ppo_kl_metric = sum_of_sample_mean_with_cp(
+                ppo_kl.abs(),
+                local_response_lengths,
+                local_loss_masks_list,
+                full_loss_masks,
+                self.cp_rank,
+                self.cp_size,
+            ).detach()
+            dist.all_reduce(ppo_kl_metric, op=dist.ReduceOp.SUM, group=self.cp_group)
 
-        loss = pg_loss - self.args.entropy_coef * entropy_loss
+            # Only compare rollout vs. train log probs when they originate from different stages.
+            train_rollout_logprob_abs_diff = None
+            if not self.args.use_rollout_logprobs and rollout_log_probs is not None:
+                diff = (old_log_probs - rollout_log_probs).abs()
+                train_rollout_logprob_abs_diff = sum_of_sample_mean_with_cp(
+                    diff, local_response_lengths, local_loss_masks_list, full_loss_masks, self.cp_rank, self.cp_size
+                ).detach()
+                dist.all_reduce(train_rollout_logprob_abs_diff, op=dist.ReduceOp.SUM, group=self.cp_group)
 
-        if self.args.use_kl_loss:
-            ref_log_probs = torch.cat([batch["ref_log_probs"] for batch in unpacked_batches], dim=0)
-            importance_ratio = None
-            if self.args.use_unbiased_kl:
-                importance_ratio = torch.exp(log_probs - old_log_probs)
-            kl = compute_approx_kl(
-                log_probs,
-                ref_log_probs,
-                kl_loss_type=self.args.kl_loss_type,
-                importance_ratio=importance_ratio,
+            entropy_loss = sum_of_sample_mean_with_cp(
+                entropy, local_response_lengths, local_loss_masks_list, full_loss_masks, self.cp_rank, self.cp_size
             )
-            kl_loss = sum_of_sample_mean(kl, response_lengths, loss_masks)
+            entropy_loss = torch.distributed.nn.functional.all_reduce(
+                entropy_loss, op=dist.ReduceOp.SUM, group=self.cp_group
+            )
 
-            loss = loss + self.args.kl_loss_coef * kl_loss
+            loss = pg_loss - self.args.entropy_coef * entropy_loss
 
-        reported = {
-            "loss": loss.detach(),
-            "pg_loss": pg_loss.detach(),
-            "pg_clipfrac": pg_clipfrac.detach(),
-            "ppo_kl": ppo_kl.detach(),
-            "entropy_loss": entropy_loss.detach(),
-        }
+            if self.args.use_kl_loss:
+                assert isinstance(ref_log_probs_local_token, torch.Tensor), "ref_log_probs must be present when use_kl_loss is enabled"
+                local_ref_log_probs_list: list[torch.Tensor] = []
+                for i, (_resp_start, _resp_end, local_lp_start, local_lp_end) in enumerate(slices):
+                    local_ref_log_probs_list.append(ref_log_probs_local_token[int(local_lp_start) : int(local_lp_end)])
+                ref_log_probs = torch.cat(local_ref_log_probs_list, dim=0)
 
-        if train_rollout_logprob_abs_diff is not None:
-            reported["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff
+                importance_ratio = None
+                if self.args.use_unbiased_kl:
+                    importance_ratio = torch.exp(log_probs - old_log_probs)
+                kl = compute_approx_kl(
+                    log_probs,
+                    ref_log_probs,
+                    kl_loss_type=self.args.kl_loss_type,
+                    importance_ratio=importance_ratio,
+                )
+                kl_loss = sum_of_sample_mean_with_cp(
+                    kl, local_response_lengths, local_loss_masks_list, full_loss_masks, self.cp_rank, self.cp_size
+                )
+                kl_loss = torch.distributed.nn.functional.all_reduce(kl_loss, op=dist.ReduceOp.SUM, group=self.cp_group)
+                loss = loss + self.args.kl_loss_coef * kl_loss
 
-        if self.args.use_kl_loss:
-            reported["kl_loss"] = kl_loss.detach()
+            reported = {
+                "loss": loss.detach(),
+                "pg_loss": pg_loss.detach(),
+                "pg_clipfrac": pg_clipfrac.detach(),
+                "ppo_kl": ppo_kl_metric.detach(),
+                "entropy_loss": entropy_loss.detach(),
+            }
 
-        if self.args.use_opsm:
-            reported["opsm_clipfrac"] = opsm_clipfrac
+            if train_rollout_logprob_abs_diff is not None:
+                reported["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff
 
-        if self.args.use_tis and tis is not None:
-            reported["tis"] = sum_of_sample_mean(tis, response_lengths, loss_masks).detach()
-            reported["ois"] = sum_of_sample_mean(ois, response_lengths, loss_masks).detach()
-            reported["tis_clipfrac"] = sum_of_sample_mean(tis_clipfrac.float(), response_lengths, loss_masks).detach()
+            if self.args.use_kl_loss:
+                reported["kl_loss"] = kl_loss.detach()
+
+            if self.args.use_opsm:
+                reported["opsm_clipfrac"] = opsm_clipfrac
+
+            if self.args.use_tis and tis is not None and ois is not None and tis_clipfrac is not None:
+                tis_scalar = sum_of_sample_mean_with_cp(
+                    tis, local_response_lengths, local_loss_masks_list, full_loss_masks, self.cp_rank, self.cp_size
+                ).detach()
+                ois_scalar = sum_of_sample_mean_with_cp(
+                    ois, local_response_lengths, local_loss_masks_list, full_loss_masks, self.cp_rank, self.cp_size
+                ).detach()
+                tis_clipfrac_scalar = sum_of_sample_mean_with_cp(
+                    tis_clipfrac.float(),
+                    local_response_lengths,
+                    local_loss_masks_list,
+                    full_loss_masks,
+                    self.cp_rank,
+                    self.cp_size,
+                ).detach()
+                dist.all_reduce(tis_scalar, op=dist.ReduceOp.SUM, group=self.cp_group)
+                dist.all_reduce(ois_scalar, op=dist.ReduceOp.SUM, group=self.cp_group)
+                dist.all_reduce(tis_clipfrac_scalar, op=dist.ReduceOp.SUM, group=self.cp_group)
+                reported["tis"] = tis_scalar
+                reported["ois"] = ois_scalar
+                reported["tis_clipfrac"] = tis_clipfrac_scalar
+
+        else:
+            unpacked_batches = unpack_sequences(packed_batch)
+
+            missing_old_log_probs = [
+                idx
+                for idx, batch in enumerate(unpacked_batches)
+                if old_log_prob_key not in batch or not isinstance(batch[old_log_prob_key], torch.Tensor)
+            ]
+            if missing_old_log_probs:
+                raise KeyError(
+                    f"{old_log_prob_key} must be provided as torch.Tensor for all microbatches when "
+                    f"use_rollout_logprobs is set to {self.args.use_rollout_logprobs}. Missing in batches: {missing_old_log_probs}"
+                )
+            old_log_probs = torch.cat([batch[old_log_prob_key] for batch in unpacked_batches], dim=0)
+            log_probs = torch.cat([batch["cur_log_probs"] for batch in unpacked_batches], dim=0)
+            advantages = torch.cat([batch["advantages"] for batch in unpacked_batches], dim=0)
+            loss_masks = [batch["loss_masks"].to(device=log_probs.device) for batch in unpacked_batches]
+            response_lengths = [batch["response_lengths"] for batch in unpacked_batches]
+
+            advantages = advantages.to(device=log_probs.device)
+            old_log_probs = old_log_probs.to(device=log_probs.device)
+            ppo_kl = old_log_probs - log_probs
+
+            if self.args.use_opsm:
+                opsm_mask, opsm_clipfrac = compute_opsm_mask(
+                    args=self.args,
+                    full_log_probs=[batch["cur_log_probs"] for batch in unpacked_batches],
+                    full_old_log_probs=[batch[old_log_prob_key] for batch in unpacked_batches],
+                    advantages=[batch["advantages"] for batch in unpacked_batches],
+                    loss_masks=loss_masks,
+                )
+
+            if self.args.advantage_estimator == "gspo":
+                ppo_kl = compute_gspo_kl(
+                    full_log_probs=[batch["cur_log_probs"] for batch in unpacked_batches],
+                    full_old_log_probs=[batch[old_log_prob_key] for batch in unpacked_batches],
+                    local_log_probs=[batch["cur_log_probs"] for batch in unpacked_batches],
+                    loss_masks=loss_masks,
+                )
+
+            pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, self.args.eps_clip, self.args.eps_clip_high)
+
+            if self.args.use_opsm:
+                pg_loss = pg_loss * opsm_mask
+
+            def _has_rollout_log_probs(batch) -> bool:
+                rollout_tensor = batch.get("rollout_log_probs")
+                return isinstance(rollout_tensor, torch.Tensor) and rollout_tensor.numel() > 0
+
+            has_rollout_log_probs = all(_has_rollout_log_probs(batch) for batch in unpacked_batches)
+            rollout_log_probs = (
+                torch.cat([batch["rollout_log_probs"] for batch in unpacked_batches], dim=0)
+                if has_rollout_log_probs
+                else None
+            )
+
+            # Apply TIS before sample mean calculation
+            if self.args.use_tis:
+                # Apply TIS off-policy correction using importance sampling
+                assert (
+                    has_rollout_log_probs and rollout_log_probs is not None
+                ), "rollout_log_probs must be provided as non-empty torch.Tensor for TIS"
+
+                tis = torch.exp(old_log_probs - rollout_log_probs)
+                ois = (-ppo_kl).exp()
+                tis_clip = torch.clamp(
+                    tis, min=getattr(self.args, "tis_clip_low", 0.1), max=getattr(self.args, "tis_clip", 2.0)
+                )
+                tis_clipfrac = tis_clip != tis
+
+                pg_loss = pg_loss * tis_clip
+
+            assert not self.args.calculate_per_token_loss, "calculate_per_token_loss not yet implemented"
+            pg_loss = sum_of_sample_mean(pg_loss, response_lengths, loss_masks)
+            pg_clipfrac = sum_of_sample_mean(pg_clipfrac, response_lengths, loss_masks)
+            ppo_kl = sum_of_sample_mean(ppo_kl.abs(), response_lengths, loss_masks)
+
+            # Only compare rollout vs. train log probs when they originate from different stages.
+            train_rollout_logprob_abs_diff = None
+            if not self.args.use_rollout_logprobs and rollout_log_probs is not None:
+                train_rollout_logprob_abs_diff = (old_log_probs - rollout_log_probs).abs()
+                train_rollout_logprob_abs_diff = sum_of_sample_mean(
+                    train_rollout_logprob_abs_diff, response_lengths, loss_masks
+                ).detach()
+
+            entropy = torch.cat([batch["entropy"] for batch in unpacked_batches], dim=0)
+            entropy_loss = sum_of_sample_mean(entropy, response_lengths, loss_masks)
+
+            loss = pg_loss - self.args.entropy_coef * entropy_loss
+
+            if self.args.use_kl_loss:
+                ref_log_probs = torch.cat([batch["ref_log_probs"] for batch in unpacked_batches], dim=0)
+                importance_ratio = None
+                if self.args.use_unbiased_kl:
+                    importance_ratio = torch.exp(log_probs - old_log_probs)
+                kl = compute_approx_kl(
+                    log_probs,
+                    ref_log_probs,
+                    kl_loss_type=self.args.kl_loss_type,
+                    importance_ratio=importance_ratio,
+                )
+                kl_loss = sum_of_sample_mean(kl, response_lengths, loss_masks)
+
+                loss = loss + self.args.kl_loss_coef * kl_loss
+
+            reported = {
+                "loss": loss.detach(),
+                "pg_loss": pg_loss.detach(),
+                "pg_clipfrac": pg_clipfrac.detach(),
+                "ppo_kl": ppo_kl.detach(),
+                "entropy_loss": entropy_loss.detach(),
+            }
+
+            if train_rollout_logprob_abs_diff is not None:
+                reported["train_rollout_logprob_abs_diff"] = train_rollout_logprob_abs_diff
+
+            if self.args.use_kl_loss:
+                reported["kl_loss"] = kl_loss.detach()
+
+            if self.args.use_opsm:
+                reported["opsm_clipfrac"] = opsm_clipfrac
+
+            if self.args.use_tis and tis is not None:
+                reported["tis"] = sum_of_sample_mean(tis, response_lengths, loss_masks).detach()
+                reported["ois"] = sum_of_sample_mean(ois, response_lengths, loss_masks).detach()
+                reported["tis_clipfrac"] = sum_of_sample_mean(tis_clipfrac.float(), response_lengths, loss_masks).detach()
 
         # Scale loss for gradient accumulation
         loss = loss * self.dp_size / self.args.global_batch_size
@@ -947,8 +1259,10 @@ def get_logprob_and_entropy_with_cp(
         temperature: Temperature parameter (optional)
 
     Returns:
-        log_probs: Aggregated log probabilities with shape [total_seq_len - 1]
-        entropy: Aggregated entropy with shape [total_seq_len - 1]
+        log_probs: Log probabilities. In CP mode (cp_size>1), returns the local
+            slice for this CP rank (no all_gather).
+        entropy: Entropy values aligned with `log_probs`. In CP mode (cp_size>1),
+            returns the local slice for this CP rank (no all_gather).
     """
     # Fast path for non-CP mode (cp_size=1): avoid unnecessary communication
     if cp_size == 1:
@@ -967,8 +1281,8 @@ def get_logprob_and_entropy_with_cp(
         tokens_start_index + chunk_size + 1 if cp_rank < cp_size - 1 else tokens_start_index + chunk_size
     )
 
-    # For the last rank, remove the last logit
-    logits = logits if cp_rank < cp_size - 1 else logits[:-1, :]
+    # For the last rank, remove the last logit (no next-token target exists)
+    shifted_logits = logits if cp_rank < cp_size - 1 else logits[:-1, :]
 
     # Get local tokens for current rank
     local_tokens = (
@@ -977,43 +1291,16 @@ def get_logprob_and_entropy_with_cp(
 
     # Compute local log probs
     local_log_probs = gather_log_probs_packed(
-        logits, local_tokens, allow_compile=allow_compile, temperature=temperature
+        shifted_logits, local_tokens, allow_compile=allow_compile, temperature=temperature
     )
 
-    # Pad for the last rank
-    if cp_rank == cp_size - 1:
-        local_log_probs = F.pad(local_log_probs, (0, chunk_size - local_log_probs.shape[0]), value=0)
-
     # Compute entropy
-    shifted_logits = logits[:-1, :] if cp_rank == cp_size - 1 else logits
     log_probs_full = torch.log_softmax(shifted_logits, dim=-1)
     probs = torch.softmax(shifted_logits, dim=-1)
     entropy = -(probs * log_probs_full).sum(dim=-1)
 
-    # Pad entropy for the last rank
-    if cp_rank == cp_size - 1:
-        entropy = F.pad(entropy, (0, chunk_size - entropy.shape[0]), value=0)
-
-    # Merge with a single all_gather: stack as [2, chunk_size]
-    stacked_local = torch.stack([local_log_probs, entropy], dim=0)
-    gathered_stacked = torch.distributed.nn.functional.all_gather(stacked_local, group=cp_group)
-
-    # Concatenate by effective length (non-last rank=chunk_size, last rank=chunk_size-1)
-    lp_parts, ent_parts = [], []
-    for r in range(cp_size):
-        eff_len = chunk_size if r < cp_size - 1 else max(0, chunk_size - 1)
-        if eff_len > 0:
-            lp_parts.append(gathered_stacked[r][0][:eff_len])
-            ent_parts.append(gathered_stacked[r][1][:eff_len])
-
-    log_probs = torch.cat(lp_parts, dim=0) if lp_parts else local_log_probs.new_zeros((0,))
-    entropy_result = torch.cat(ent_parts, dim=0) if ent_parts else entropy.new_zeros((0,))
-
-    # Truncate to global effective length T-1 (packed tokens length is T)
-    log_probs = log_probs[: len(target_tokens) - 1]
-    entropy_result = entropy_result[: len(target_tokens) - 1]
-
-    return log_probs, entropy_result
+    # CP mode: return local slices only (no all_gather).
+    return local_log_probs, entropy
 
 
 def sum_of_sample_mean(x: torch.Tensor, response_lengths: list[int], loss_masks: list[torch.Tensor]) -> torch.Tensor:
@@ -1034,6 +1321,136 @@ def sum_of_sample_mean(x: torch.Tensor, response_lengths: list[int], loss_masks:
             for x_i, loss_mask_i in zip(x.split(response_lengths, dim=0), loss_masks, strict=False)
         ]
     )
+
+
+def _get_trailing_pad_len_for_cp(tokens: torch.Tensor, cp_size: int) -> int:
+    """Best-effort trailing padding length for CP padded packed batches.
+
+    CP padding in this backend pads only at the end of the packed batch with
+    value 0, and at most `cp_size - 1` tokens. We only inspect the tail to avoid
+    scanning the full tensor.
+    """
+    if cp_size <= 1:
+        return 0
+    if tokens.numel() == 0:
+        return 0
+
+    check = min(cp_size, int(tokens.numel()))
+    tail = tokens[-check:].detach()
+    if tail.is_cuda:
+        tail = tail.cpu()
+    tail_list = tail.tolist()
+
+    pad_len = 0
+    for v in reversed(tail_list):
+        if v == 0:
+            pad_len += 1
+        else:
+            break
+    return pad_len
+
+
+def _get_local_response_logprob_slices_for_packed_batch(
+    cu_seqlens: torch.Tensor,
+    response_lengths: list[int],
+    cp_rank: int,
+    cp_size: int,
+    chunk_size: int,
+    pad_length: int,
+) -> list[tuple[int, int, int, int]]:
+    """Compute local response slices for CP given a packed batch.
+
+    Returns a list with one entry per sequence:
+      (resp_start, resp_end, local_lp_start, local_lp_end)
+
+    - resp_* are indices within the per-sequence response-only tensors
+      (e.g. loss_masks/advantages/rollout_log_probs), i.e. [0, response_len].
+    - local_lp_* are indices into this rank's local log-prob / entropy vectors,
+      which correspond to the global log-prob index range:
+        [chunk_size * cp_rank, chunk_size * (cp_rank + 1)) for non-last ranks,
+        and [chunk_size * cp_rank, chunk_size * (cp_rank + 1) - 1) for last rank.
+    """
+    if cp_size <= 1:
+        raise ValueError("_get_local_response_logprob_slices_for_packed_batch is CP-only (cp_size>1)")
+
+    # cu_seqlens is int32 on GPU; bring small metadata to CPU for indexing.
+    if cu_seqlens.is_cuda:
+        cu = cu_seqlens.detach().cpu().tolist()
+    else:
+        cu = cu_seqlens.detach().tolist()
+
+    num_sequences = len(cu) - 1
+    if num_sequences != len(response_lengths):
+        raise ValueError(f"cu_seqlens implies {num_sequences} sequences but response_lengths has {len(response_lengths)}")
+
+    global_lp_start = chunk_size * cp_rank
+    global_lp_end = global_lp_start + (chunk_size if cp_rank < cp_size - 1 else max(0, chunk_size - 1))
+
+    slices: list[tuple[int, int, int, int]] = []
+    for i in range(num_sequences):
+        resp_len = int(response_lengths[i])
+        if resp_len <= 0:
+            slices.append((0, 0, 0, 0))
+            continue
+
+        end_token = int(cu[i + 1])
+        if i == num_sequences - 1 and pad_length > 0:
+            end_token = max(0, end_token - pad_length)
+
+        # Response tokens are the last `resp_len` tokens of the sequence.
+        # Response log-probs correspond to token indices [end_token - resp_len, end_token),
+        # which map to log-prob indices [end_token - resp_len - 1, end_token - 1).
+        resp_lp_start = end_token - resp_len - 1
+        resp_lp_end = end_token - 1
+
+        inter_start = max(resp_lp_start, global_lp_start)
+        inter_end = min(resp_lp_end, global_lp_end)
+
+        if inter_end <= inter_start:
+            slices.append((0, 0, 0, 0))
+            continue
+
+        resp_start = inter_start - resp_lp_start
+        resp_end = inter_end - resp_lp_start
+        local_lp_start = inter_start - global_lp_start
+        local_lp_end = inter_end - global_lp_start
+        slices.append((resp_start, resp_end, local_lp_start, local_lp_end))
+
+    return slices
+
+
+def sum_of_sample_mean_with_cp(
+    x: torch.Tensor,
+    local_response_lengths: list[int],
+    local_loss_masks: list[torch.Tensor],
+    full_loss_masks: list[torch.Tensor],
+    cp_rank: int,
+    cp_size: int,
+) -> torch.Tensor:
+    """CP-aware variant of `sum_of_sample_mean` for response-only tensors.
+
+    In CP mode, `x` is the concatenation of per-sequence LOCAL response slices
+    for the current CP rank (some sequences may contribute 0 tokens). The
+    numerator uses the local slice + local mask, while the denominator uses the
+    FULL per-sequence mask sum so that summing across CP ranks reconstructs the
+    original computation.
+    """
+    if cp_size == 1:
+        return sum_of_sample_mean(x, local_response_lengths, full_loss_masks)
+
+    result = torch.zeros((), device=x.device, dtype=x.dtype)
+    offset = 0
+    for local_len, local_mask, full_mask in zip(
+        local_response_lengths, local_loss_masks, full_loss_masks, strict=False
+    ):
+        local_len = int(local_len)
+        if local_len > 0:
+            x_chunk = x[offset : offset + local_len]
+            numerator = (x_chunk * local_mask).sum()
+            denominator = torch.clamp_min(full_mask.sum(), 1)
+            result = result + numerator / denominator
+        offset += local_len
+    return result
 
 
 @torch.no_grad()

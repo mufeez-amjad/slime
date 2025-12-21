@@ -121,6 +121,87 @@ def compute_gspo_kl(
     return ppo_kl
 
 
+def compute_gspo_kl_with_cp(
+    local_log_probs: list[torch.Tensor],
+    local_old_log_probs: list[torch.Tensor],
+    local_loss_masks: list[torch.Tensor],
+    full_loss_masks: list[torch.Tensor],
+    cp_group,
+    cp_size: int,
+) -> torch.Tensor:
+    """Compute GSPO per-sequence KL in CP using all_reduce on per-sequence scalars.
+
+    This avoids all_gather of per-token log-probs. Each CP rank computes partial
+    numerator sums on its local response slice, then all_reduces the per-sequence
+    sums to reconstruct full-sequence KL values.
+    """
+    if cp_size == 1:
+        return compute_gspo_kl(
+            full_log_probs=local_log_probs,
+            full_old_log_probs=local_old_log_probs,
+            local_log_probs=local_log_probs,
+            loss_masks=full_loss_masks,
+        )
+
+    partial_sums = torch.stack(
+        [
+            ((old_lp - lp) * local_mask).sum()
+            for lp, old_lp, local_mask in zip(local_log_probs, local_old_log_probs, local_loss_masks, strict=False)
+        ]
+    )
+    full_sums = dist.nn.functional.all_reduce(partial_sums, op=dist.ReduceOp.SUM, group=cp_group)
+
+    per_token_kl = []
+    for i, (lp, full_mask) in enumerate(zip(local_log_probs, full_loss_masks, strict=False)):
+        seq_kl = full_sums[i] / torch.clamp_min(full_mask.sum(), 1)
+        per_token_kl.append(seq_kl.expand_as(lp))
+    return torch.cat(per_token_kl, dim=0)
+
+
+def compute_opsm_mask_with_cp(
+    args: Namespace,
+    local_log_probs: list[torch.Tensor],
+    local_old_log_probs: list[torch.Tensor],
+    local_advantages: list[torch.Tensor],
+    local_loss_masks: list[torch.Tensor],
+    full_loss_masks: list[torch.Tensor],
+    cp_group,
+    cp_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Compute OPSM mask in CP using all_reduce on per-sequence scalars."""
+    if cp_size == 1:
+        return compute_opsm_mask(
+            args=args,
+            full_log_probs=local_log_probs,
+            full_old_log_probs=local_old_log_probs,
+            advantages=local_advantages,
+            loss_masks=full_loss_masks,
+        )
+
+    partial_sums = torch.stack(
+        [
+            ((old_lp - lp) * local_mask).sum()
+            for lp, old_lp, local_mask in zip(local_log_probs, local_old_log_probs, local_loss_masks, strict=False)
+        ]
+    )
+    full_sums = dist.nn.functional.all_reduce(partial_sums, op=dist.ReduceOp.SUM, group=cp_group)
+
+    opsm_mask_list = []
+    device = local_advantages[0].device if local_advantages else local_log_probs[0].device
+    opsm_clipfrac = torch.zeros((), device=device)
+
+    for i, (lp, adv, local_mask, full_mask) in enumerate(
+        zip(local_log_probs, local_advantages, local_loss_masks, full_loss_masks, strict=False)
+    ):
+        seq_kl = full_sums[i] / torch.clamp_min(full_mask.sum(), 1)
+        mask = ((adv < 0) & (seq_kl > args.opsm_delta)).float()
+        opsm_clipfrac += mask.sum() / torch.clamp_min(full_mask.sum(), 1)
+        opsm_mask_list.append(1 - mask)
+
+    dist.all_reduce(opsm_clipfrac, op=dist.ReduceOp.SUM, group=cp_group)
+    return torch.cat(opsm_mask_list, dim=0), opsm_clipfrac
+
+
 @torch.compile(dynamic=True)
 def compute_policy_loss(
     ppo_kl: torch.Tensor,
