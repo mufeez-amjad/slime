@@ -69,7 +69,7 @@ def pack_sequences(
         flat_positionids = []
         flat_advantages = []
         flat_returns = []
-        flat_rollout_log_probs = []
+        flat_rollout_log_probs: list[float] | None = [] if rollout_log_probs else None
 
         for i in indices:
             seq_tokens = tokens[i]
@@ -81,7 +81,7 @@ def pack_sequences(
             flat_masks.extend(seq_mask)
             flat_advantages.extend(advantages[i])
             flat_returns.extend(returns[i])
-            if rollout_log_probs:
+            if flat_rollout_log_probs is not None:
                 flat_rollout_log_probs.extend(rollout_log_probs[i])
             cu_seqlens.append(cu_seqlens[-1] + len(seq_tokens))
 
@@ -95,10 +95,11 @@ def pack_sequences(
             "response_lengths": [response_lengths[i] for i in indices],
             "advantages": torch.tensor(flat_advantages, dtype=torch.float32),
             "returns": torch.tensor(flat_returns, dtype=torch.float32),
-            "rollout_log_probs": torch.tensor(
-                flat_rollout_log_probs, dtype=torch.float32, device=torch.cuda.current_device()
-            ),
         }
+        if flat_rollout_log_probs is not None:
+            packed_batch["rollout_log_probs"] = torch.tensor(
+                flat_rollout_log_probs, dtype=torch.float32, device=torch.cuda.current_device()
+            )
 
         # Collect and add multimodal inputs for this partition
         if multimodal_inputs:

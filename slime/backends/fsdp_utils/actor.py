@@ -376,7 +376,7 @@ class FSDPTrainRayActor(TrainRayActor):
                     tqdm(packed_batches, desc=f"{store_prefix}log_probs", disable=dist.get_rank() != 0)
                 ):
                     model_args = self._get_model_inputs_args(batch)
-                    logits = active_model(**model_args).logits.squeeze(0).float()
+                    logits = active_model(**model_args).logits.squeeze(0)
                     log_probs_result, entropy_result = get_logprob_and_entropy_with_cp(
                         logits=logits,
                         target_tokens=batch["tokens"],
@@ -386,7 +386,9 @@ class FSDPTrainRayActor(TrainRayActor):
                         model_input_ids=model_args["input_ids"],
                         allow_compile=not self.args.true_on_policy_mode,
                         temperature=self.args.rollout_temperature,
+                        compute_entropy=self.args.entropy_coef != 0,
                     )
+                    del logits
                     batch[f"{store_prefix}log_probs"] = log_probs_result
                     if store_prefix == "":
                         batch["entropy"] = entropy_result
@@ -523,6 +525,17 @@ class FSDPTrainRayActor(TrainRayActor):
                         if isinstance(unpacked_batch[metric_key], torch.Tensor):
                             loss_masks_tensor = unpacked_batch["loss_masks"].to(device=torch.cuda.current_device())
                             metric_tensor = unpacked_batch[metric_key].to(device=torch.cuda.current_device())
+                            if metric_tensor.numel() == 0:
+                                continue
+                            if metric_tensor.numel() != loss_masks_tensor.numel():
+                                if dist.get_rank() == 0:
+                                    logger.warning(
+                                        "Skipping rollout metric %s due to shape mismatch: metric=%s masks=%s",
+                                        metric_key,
+                                        tuple(metric_tensor.shape),
+                                        tuple(loss_masks_tensor.shape),
+                                    )
+                                continue
                             val += (metric_tensor * loss_masks_tensor).sum() / loss_masks_tensor.sum().clamp_min(1)
                         else:
                             val += unpacked_batch[metric_key]
@@ -653,7 +666,7 @@ class FSDPTrainRayActor(TrainRayActor):
     def _train_step(self, packed_batch, reported_accum, mbs_id, grad_accum):
         # Prepare model inputs
         model_args = self._get_model_inputs_args(packed_batch)
-        logits = self.model(**model_args).logits.squeeze(0).float()
+        logits = self.model(**model_args).logits.squeeze(0)
 
         # Compute log probs and entropy (unified for both CP and non-CP modes)
         log_probs, entropy_result = get_logprob_and_entropy_with_cp(
@@ -665,7 +678,9 @@ class FSDPTrainRayActor(TrainRayActor):
             model_input_ids=model_args["input_ids"],
             allow_compile=not self.args.true_on_policy_mode,
             temperature=self.args.rollout_temperature,
+            compute_entropy=self.args.entropy_coef != 0,
         )
+        del logits
         packed_batch["cur_log_probs"] = log_probs
         packed_batch["entropy"] = entropy_result
 
@@ -1189,7 +1204,9 @@ def selective_log_softmax_raw(logits: torch.Tensor, input_ids: torch.Tensor) -> 
     """Fused version of the common `log_softmax -> gather` operation.
 
     The fused version of this operation avoids the (potentially large) memory overhead
-    of allocating a new tensor to store the full logprobs.
+    of allocating a new tensor to store the full log-prob matrix. It uses:
+
+        log p(y) = logit[y] - logsumexp(logits)
 
     Parameters:
         logits: Tensor of shape [..., V] containing model logits.
@@ -1198,11 +1215,32 @@ def selective_log_softmax_raw(logits: torch.Tensor, input_ids: torch.Tensor) -> 
     Returns:
         Tensor of shape [...] containing the log-probabilities corresponding to `input_ids`.
     """
-    logprobs = logits.log_softmax(dim=-1)
-    return torch.gather(logprobs, dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1)
+    target_logits = torch.gather(logits, dim=-1, index=input_ids.unsqueeze(-1)).squeeze(-1).float()
+    lse = torch.logsumexp(logits, dim=-1).float()
+    return target_logits - lse
 
 
 selective_log_softmax_compiled = torch.compile(dynamic=True)(selective_log_softmax_raw)
+
+
+def entropy_from_logits_chunked(logits: torch.Tensor, vocab_chunk_size: int = 8192) -> torch.Tensor:
+    """Compute categorical entropy per position without materializing full softmax/log_softmax tensors.
+
+    H(p) = logsumexp(z) - E_p[z]
+    """
+    # logsumexp over vocab. Keep this cheap (returns [...]).
+    lse = torch.logsumexp(logits, dim=-1).float()
+
+    # E_p[z] = sum softmax(z) * z. Compute in vocab chunks to cap peak memory.
+    expected_logit = torch.zeros_like(lse)
+    vocab_size = int(logits.shape[-1])
+    lse_expanded = lse.unsqueeze(-1)
+    for start in range(0, vocab_size, vocab_chunk_size):
+        end = min(vocab_size, start + vocab_chunk_size)
+        chunk = logits[..., start:end].float()
+        probs = torch.exp(chunk - lse_expanded)
+        expected_logit += (probs * chunk).sum(dim=-1)
+    return lse - expected_logit
 
 
 def gather_log_probs_packed(
@@ -1210,7 +1248,7 @@ def gather_log_probs_packed(
     input_ids: torch.Tensor,
     allow_compile: bool,
     cu_seqlens: torch.Tensor | float | None = None,
-    temperature: torch.Tensor | None = None,
+    temperature: float | torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Gather next-token log probabilities for packed sequences.
 
@@ -1230,7 +1268,16 @@ def gather_log_probs_packed(
         input_ids = input_ids.squeeze(0)
 
     if temperature is not None:
-        shifted_logits = shifted_logits.div(temperature)
+        # Avoid an out-of-place scale (which can OOM for large vocab logits).
+        if isinstance(temperature, torch.Tensor):
+            if temperature.numel() != 1:
+                raise ValueError(f"temperature must be scalar, got shape {tuple(temperature.shape)}")
+            if float(temperature.item()) != 1.0:
+                shifted_logits.mul_(temperature.reciprocal())
+        else:
+            temp = float(temperature)
+            if temp != 1.0:
+                shifted_logits.mul_(1.0 / temp)
 
     targets = input_ids[1:].to(device=shifted_logits.device)
 
@@ -1248,6 +1295,7 @@ def get_logprob_and_entropy_with_cp(
     model_input_ids: torch.Tensor,
     allow_compile: bool,
     temperature: float | None = None,
+    compute_entropy: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute log probabilities and entropy in Context Parallel mode.
 
@@ -1273,9 +1321,10 @@ def get_logprob_and_entropy_with_cp(
         local_log_probs = gather_log_probs_packed(
             shifted_logits, target_tokens, allow_compile=allow_compile, temperature=temperature
         )
-        log_probs_full = torch.log_softmax(shifted_logits, dim=-1)
-        probs = torch.softmax(shifted_logits, dim=-1)
-        entropy = -(probs * log_probs_full).sum(dim=-1)
+        if not compute_entropy:
+            entropy = torch.zeros_like(local_log_probs)
+        else:
+            entropy = entropy_from_logits_chunked(shifted_logits)
         return local_log_probs, entropy
 
     chunk_size = logits.shape[0]
@@ -1298,9 +1347,10 @@ def get_logprob_and_entropy_with_cp(
     )
 
     # Compute entropy
-    log_probs_full = torch.log_softmax(shifted_logits, dim=-1)
-    probs = torch.softmax(shifted_logits, dim=-1)
-    entropy = -(probs * log_probs_full).sum(dim=-1)
+    if not compute_entropy:
+        entropy = torch.zeros_like(local_log_probs)
+    else:
+        entropy = entropy_from_logits_chunked(shifted_logits)
 
     # CP mode: return local slices only (no all_gather).
     return local_log_probs, entropy
