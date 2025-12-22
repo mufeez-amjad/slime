@@ -488,6 +488,9 @@ class FSDPTrainRayActor(TrainRayActor):
         if self.args.offload_train:
             self.wake_up()
 
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+
         with inverse_timer("train_wait"), timer("train"):
             rollout_data = process_rollout_data(self.args, rollout_data_ref, self.dp_rank, self.dp_size)
             if self.args.debug_rollout_only:

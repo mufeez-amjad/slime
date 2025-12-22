@@ -1005,6 +1005,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help=("Dump all details of training for post-hoc analysis and visualization."),
             )
+            parser.add_argument(
+                "--perf-jsonl-path",
+                type=str,
+                default=None,
+                help=(
+                    "Append per-rollout performance metrics as JSONL. "
+                    "Prefer this over --dump-details for benchmarking to avoid extra debug I/O."
+                ),
+            )
             # use together with --record-memory-history and --memory-snapshot-path (defined in Megatron)
             parser.add_argument(
                 "--memory-snapshot-dir",
